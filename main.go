@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -257,6 +258,9 @@ func run(args []string) error {
 		return cmdGroup(args[1:])
 	case "run", "r":
 		return cmdRun(args[1:])
+	case "version", "v", "--version", "-v":
+		printVersion()
+		return nil
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -276,12 +280,43 @@ Usage:
   up group add <group> <service...>
   up group remove <group> <service...>
   up group delete <group>
+  up version
 
 Examples:
   up add claude-web --cwd F:\projects\claude-web --port 8766 "uv run python main.py"
   up add front --cwd F:\projects\front --port 5173 "npm run dev"
   up group add morning claude-web front
   up run morning`)
+}
+
+func printVersion() {
+	version := "dev"
+	revision := ""
+	modified := ""
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			version = info.Main.Version
+		}
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if len(setting.Value) >= 12 {
+					revision = setting.Value[:12]
+				} else {
+					revision = setting.Value
+				}
+			case "vcs.modified":
+				modified = setting.Value
+			}
+		}
+	}
+	fmt.Printf("up %s\n", version)
+	if revision != "" {
+		fmt.Printf("commit %s\n", revision)
+	}
+	if modified == "true" {
+		fmt.Println("modified true")
+	}
 }
 
 func cmdAdd(args []string) error {

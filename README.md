@@ -63,6 +63,7 @@ up delete <name>
 up group add <group> <service...>
 up group remove <group> <service...>
 up group delete <group>
+up version
 ```
 
 ## Config
