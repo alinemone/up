@@ -1,0 +1,6 @@
+devkeep.exe
+devkeep.exe~
+*.exe
+*.test
+coverage.out
+.tmp-home/
