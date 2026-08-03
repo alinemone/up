@@ -406,9 +406,17 @@ func (m appModel) renderTable(stateByName map[string]RuntimeState) string {
 	compact := m.width < 88
 	var b strings.Builder
 	if compact {
-		b.WriteString(fmt.Sprintf("%-16s %-13s %-8s %s\n", "SERVICE", "STATUS", "PORT", "NEXT"))
+		b.WriteString(strings.Join([]string{padCell("SERVICE", 16), padCell("STATUS", 13), padCell("PORT", 8), "NEXT"}, " ") + "\n")
 	} else {
-		b.WriteString(fmt.Sprintf("%-18s %-13s %-7s %-8s %-10s %-9s %s\n", "SERVICE", "STATUS", "PID", "PORT", "UPTIME", "RESTARTS", "NEXT"))
+		b.WriteString(strings.Join([]string{
+			padCell("SERVICE", 18),
+			padCell("STATUS", 13),
+			padCell("PID", 7),
+			padCell("PORT", 8),
+			padCell("UPTIME", 10),
+			padCell("RESTARTS", 9),
+			"NEXT",
+		}, " ") + "\n")
 	}
 	b.WriteString(mutedStyle.Render(strings.Repeat("─", max(48, min(m.width, 120)))) + "\n")
 	for i, name := range m.services {
@@ -444,10 +452,22 @@ func (m appModel) renderStateLine(state RuntimeState, compact bool) string {
 		next = state.NextRun.Format("15:04:05")
 	}
 	if compact {
-		return fmt.Sprintf("%-16s %-22s %-8s %s", truncate(state.Name, 16), styledStatus(state.Status), port, next)
+		return strings.Join([]string{
+			padCell(truncate(state.Name, 16), 16),
+			padCell(styledStatus(state.Status), 13),
+			padCell(port, 8),
+			next,
+		}, " ")
 	}
-	return fmt.Sprintf("%-18s %-22s %-7s %-8s %-10s %-9d %s",
-		truncate(state.Name, 18), styledStatus(state.Status), pid, port, uptime, state.Restarts, next)
+	return strings.Join([]string{
+		padCell(truncate(state.Name, 18), 18),
+		padCell(styledStatus(state.Status), 13),
+		padCell(pid, 7),
+		padCell(port, 8),
+		padCell(uptime, 10),
+		padCell(strconv.Itoa(state.Restarts), 9),
+		next,
+	}, " ")
 }
 
 func (m appModel) renderLogs(logs []RuntimeLog) string {
@@ -530,6 +550,14 @@ func styledStatus(status string) string {
 	default:
 		return mutedStyle.Render(label)
 	}
+}
+
+func padCell(value string, width int) string {
+	visible := lipgloss.Width(value)
+	if visible >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-visible)
 }
 
 func (m *Monitor) renderLoop(ctx context.Context) {
@@ -1220,6 +1248,10 @@ func runOnce(ctx context.Context, mon *Monitor, name string, svc Service) (int, 
 	go func() {
 		<-ctx.Done()
 		killProcessTree(cmd.Process.Pid)
+		if svc.Port > 0 {
+			time.Sleep(500 * time.Millisecond)
+			killListenersOnPort(svc.Port)
+		}
 	}()
 
 	mon.update(name, func(state *RuntimeState) {
