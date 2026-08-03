@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -456,26 +455,6 @@ func streamLines(wg *sync.WaitGroup, name string, r io.Reader, isErr bool) {
 			prefix = "err"
 		}
 		logLine(name, prefix+" "+scanner.Text())
-	}
-}
-
-func shellCommand(ctx context.Context, command string) *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		return exec.CommandContext(ctx, "cmd", "/C", command)
-	}
-	return exec.CommandContext(ctx, "sh", "-c", command)
-}
-
-func killProcessTree(pid int) {
-	if pid <= 0 {
-		return
-	}
-	if runtime.GOOS == "windows" {
-		_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
-		return
-	}
-	if proc, err := os.FindProcess(pid); err == nil {
-		_ = proc.Kill()
 	}
 }
 
