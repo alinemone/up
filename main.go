@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/term"
 )
 
 const appName = "up"
@@ -137,6 +139,16 @@ func (m *Monitor) renderLoop(ctx context.Context) {
 }
 
 func (m *Monitor) render() {
+	width := terminalWidth()
+	compact := width < 86
+	ruleWidth := width
+	if ruleWidth > 120 {
+		ruleWidth = 120
+	}
+	if ruleWidth < 48 {
+		ruleWidth = 48
+	}
+
 	m.mu.Lock()
 	states := make([]RuntimeState, 0, len(m.states))
 	for _, state := range m.states {
@@ -149,17 +161,23 @@ func (m *Monitor) render() {
 
 	fmt.Print("\033[2J\033[H")
 	fmt.Println(ansiBold + ansiCyan + "up" + ansiReset + ansiDim + " local dev monitor" + ansiReset)
-	fmt.Println(ansiGray + strings.Repeat("─", 96) + ansiReset)
-	fmt.Printf("%-18s %-13s %-7s %-8s %-10s %-9s %s\n", "SERVICE", "STATUS", "PID", "PORT", "UPTIME", "RESTARTS", "NEXT")
-	fmt.Println(ansiGray + strings.Repeat("─", 96) + ansiReset)
+	fmt.Println(ansiGray + strings.Repeat("─", ruleWidth) + ansiReset)
+	if compact {
+		fmt.Printf("%-16s %-13s %-8s %s\n", "SERVICE", "STATUS", "PORT", "NEXT")
+	} else {
+		fmt.Printf("%-18s %-13s %-7s %-8s %-10s %-9s %s\n", "SERVICE", "STATUS", "PID", "PORT", "UPTIME", "RESTARTS", "NEXT")
+	}
+	fmt.Println(ansiGray + strings.Repeat("─", ruleWidth) + ansiReset)
 	for _, state := range states {
 		pid := "-"
 		if state.PID > 0 {
 			pid = strconv.Itoa(state.PID)
 		}
-		port := "-"
+		portText := "-"
+		portVisible := 1
 		if state.Port > 0 {
-			port = strconv.Itoa(state.Port)
+			portText = terminalLink("http://localhost:"+strconv.Itoa(state.Port), strconv.Itoa(state.Port))
+			portVisible = len(strconv.Itoa(state.Port))
 		}
 		uptime := "-"
 		if !state.StartedAt.IsZero() && state.PID > 0 {
@@ -169,25 +187,38 @@ func (m *Monitor) render() {
 		if !state.NextRun.IsZero() {
 			next = state.NextRun.Format("15:04:05")
 		}
-		fmt.Printf("%-18s %-22s %-7s %-8s %-10s %-9d %s\n",
-			truncate(state.Name, 18),
-			colorStatus(state.Status),
-			pid,
-			port,
-			uptime,
-			state.Restarts,
-			next,
-		)
+		if compact {
+			fmt.Printf("%s %s %s %s\n",
+				cell(truncate(state.Name, 16), 16),
+				colorStatus(state.Status),
+				ansiCell(portText, portVisible, 8),
+				next,
+			)
+		} else {
+			fmt.Printf("%s %s %s %s %s %s %s\n",
+				cell(truncate(state.Name, 18), 18),
+				colorStatus(state.Status),
+				cell(pid, 7),
+				ansiCell(portText, portVisible, 8),
+				cell(uptime, 10),
+				cell(strconv.Itoa(state.Restarts), 9),
+				next,
+			)
+		}
 		if state.LastExit != "" {
-			fmt.Println("  " + ansiDim + truncate(state.LastExit, 92) + ansiReset)
+			fmt.Println("  " + ansiDim + truncate(state.LastExit, ruleWidth-4) + ansiReset)
 		}
 	}
 	fmt.Println()
 	fmt.Println(ansiBold + "Logs" + ansiReset + ansiDim + " (latest)" + ansiReset)
-	fmt.Println(ansiGray + strings.Repeat("─", 96) + ansiReset)
+	fmt.Println(ansiGray + strings.Repeat("─", ruleWidth) + ansiReset)
 	if len(logs) == 0 {
 		fmt.Println(ansiDim + "No logs yet" + ansiReset)
 	} else {
+		msgWidth := ruleWidth - 30
+		if msgWidth < 20 {
+			msgWidth = 20
+		}
 		for _, entry := range logs {
 			stream := entry.Stream
 			if stream == "err" {
@@ -199,7 +230,7 @@ func (m *Monitor) render() {
 				ansiGray+entry.Time.Format("15:04:05")+ansiReset,
 				"["+truncate(entry.Service, 14)+"]",
 				stream,
-				truncate(entry.Message, 70),
+				truncate(entry.Message, msgWidth),
 			)
 		}
 	}
@@ -232,6 +263,40 @@ func shortDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
 	}
 	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+func terminalWidth() int {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err == nil && width > 0 {
+		return width
+	}
+	if value := strings.TrimSpace(os.Getenv("COLUMNS")); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 100
+}
+
+func terminalLink(url, label string) string {
+	if os.Getenv("UP_NO_LINKS") == "1" {
+		return label
+	}
+	return "\033]8;;" + url + "\033\\" + label + "\033]8;;\033\\"
+}
+
+func cell(value string, width int) string {
+	if len(value) >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-len(value))
+}
+
+func ansiCell(value string, visibleWidth, width int) string {
+	if visibleWidth >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-visibleWidth)
 }
 
 func main() {

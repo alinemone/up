@@ -110,5 +110,10 @@ start. If it has `restart: false`, `every` behaves like a repeated job interval.
 
 ## Monitor
 
-`up run ...` opens a colored terminal dashboard with service status, PID, port,
-uptime, restart count, next scheduled run, and recent logs.
+`up run ...` opens a responsive colored terminal dashboard with service status,
+PID, port, uptime, restart count, next scheduled run, and recent logs.
+
+When a service has a port, terminals that support OSC 8 hyperlinks can open it
+directly from the dashboard as `http://localhost:<port>`.
+
+Set `UP_NO_LINKS=1` to disable terminal hyperlinks.
