@@ -6,3 +6,4 @@ devkeep.exe~
 *.test
 coverage.out
 .tmp-home/
+.idea/
