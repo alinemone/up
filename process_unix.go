@@ -23,18 +23,21 @@ func killProcessTree(pid int) {
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }
 
-func killListenersOnPort(port int) {
+func killListenersOnPort(port int) []int {
 	out, err := exec.Command("lsof", "-ti", "tcp:"+strconv.Itoa(port), "-sTCP:LISTEN").Output()
 	if err != nil {
-		return
+		return nil
 	}
 	seen := make(map[int]bool)
+	var pids []int
 	for _, field := range strings.Fields(string(out)) {
 		pid, err := strconv.Atoi(field)
 		if err != nil || pid <= 0 || seen[pid] {
 			continue
 		}
 		seen[pid] = true
+		pids = append(pids, pid)
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
+	return pids
 }

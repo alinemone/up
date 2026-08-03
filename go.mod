@@ -5,7 +5,6 @@ go 1.22.0
 require (
 	github.com/charmbracelet/bubbletea v1.3.4
 	github.com/charmbracelet/lipgloss v1.0.0
-	golang.org/x/term v0.28.0
 )
 
 require (

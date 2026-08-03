@@ -20,11 +20,12 @@ func killProcessTree(pid int) {
 	_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
 }
 
-func killListenersOnPort(port int) {
+func killListenersOnPort(port int) []int {
 	pids := windowsListeningPIDs(port)
 	for _, pid := range pids {
 		_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
 	}
+	return pids
 }
 
 func windowsListeningPIDs(port int) []int {

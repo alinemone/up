@@ -3,6 +3,7 @@ up.exe~
 devkeep.exe
 devkeep.exe~
 *.exe
+*.exe~
 *.test
 coverage.out
 .tmp-home/

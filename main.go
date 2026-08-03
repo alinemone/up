@@ -9,17 +9,18 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"golang.org/x/term"
 )
 
 const appName = "up"
@@ -71,18 +72,6 @@ type Monitor struct {
 
 const maxLogs = 14
 
-const (
-	ansiReset  = "\033[0m"
-	ansiBold   = "\033[1m"
-	ansiDim    = "\033[2m"
-	ansiGreen  = "\033[32m"
-	ansiYellow = "\033[33m"
-	ansiRed    = "\033[31m"
-	ansiCyan   = "\033[36m"
-	ansiBlue   = "\033[34m"
-	ansiGray   = "\033[90m"
-)
-
 func newMonitor(names []string, cfg Config) *Monitor {
 	m := &Monitor{states: make(map[string]RuntimeState)}
 	for _, name := range names {
@@ -109,6 +98,12 @@ func (m *Monitor) update(name string, fn func(*RuntimeState)) {
 	m.states[name] = state
 }
 
+func (m *Monitor) remove(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.states, name)
+}
+
 func (m *Monitor) addLog(name, stream, message string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -121,6 +116,12 @@ func (m *Monitor) addLog(name, stream, message string) {
 	if len(m.logs) > maxLogs {
 		m.logs = append([]RuntimeLog(nil), m.logs[len(m.logs)-maxLogs:]...)
 	}
+}
+
+func (m *Monitor) clearLogs() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logs = nil
 }
 
 func (m *Monitor) snapshot() ([]RuntimeState, []RuntimeLog) {
@@ -136,19 +137,24 @@ func (m *Monitor) snapshot() ([]RuntimeState, []RuntimeLog) {
 }
 
 type Runner struct {
-	ctx    context.Context
-	cfg    Config
-	mon    *Monitor
-	mu     sync.Mutex
-	cancel map[string]context.CancelFunc
+	ctx  context.Context
+	cfg  Config
+	mon  *Monitor
+	mu   sync.Mutex
+	runs map[string]*runHandle
+}
+
+type runHandle struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func newRunner(ctx context.Context, cfg Config, mon *Monitor) *Runner {
 	return &Runner{
-		ctx:    ctx,
-		cfg:    cfg,
-		mon:    mon,
-		cancel: make(map[string]context.CancelFunc),
+		ctx:  ctx,
+		cfg:  cfg,
+		mon:  mon,
+		runs: make(map[string]*runHandle),
 	}
 }
 
@@ -159,12 +165,13 @@ func (r *Runner) Start(name string) error {
 	}
 
 	r.mu.Lock()
-	if _, running := r.cancel[name]; running {
+	if _, running := r.runs[name]; running {
 		r.mu.Unlock()
 		return nil
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
-	r.cancel[name] = cancel
+	done := make(chan struct{})
+	r.runs[name] = &runHandle{cancel: cancel, done: done}
 	r.mu.Unlock()
 
 	r.mon.update(name, func(state *RuntimeState) {
@@ -177,18 +184,14 @@ func (r *Runner) Start(name string) error {
 	})
 
 	go func() {
+		defer close(done)
 		supervise(ctx, r.mon, name, svc)
 		r.mu.Lock()
-		delete(r.cancel, name)
+		delete(r.runs, name)
 		r.mu.Unlock()
 		if ctx.Err() != nil {
-			r.mon.update(name, func(state *RuntimeState) {
-				state.Status = "stopped"
-				state.PID = 0
-				state.NextRun = time.Time{}
-				state.LastExit = "stopped by user"
-			})
 			r.mon.addLog(name, "sys", "stopped by user")
+			r.mon.remove(name)
 		}
 	}()
 	return nil
@@ -196,10 +199,14 @@ func (r *Runner) Start(name string) error {
 
 func (r *Runner) Stop(name string) {
 	r.mu.Lock()
-	cancel := r.cancel[name]
+	handle := r.runs[name]
 	r.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if handle != nil {
+		r.mon.update(name, func(state *RuntimeState) {
+			state.Status = "stopping"
+			state.LastExit = ""
+		})
+		handle.cancel()
 	}
 }
 
@@ -213,20 +220,28 @@ func (r *Runner) Restart(name string) {
 
 func (r *Runner) StopAll() {
 	r.mu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(r.cancel))
-	for _, cancel := range r.cancel {
-		cancels = append(cancels, cancel)
+	handles := make([]*runHandle, 0, len(r.runs))
+	for _, handle := range r.runs {
+		handles = append(handles, handle)
 	}
 	r.mu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
+	for _, handle := range handles {
+		handle.cancel()
+	}
+	deadline := time.After(8 * time.Second)
+	for _, handle := range handles {
+		select {
+		case <-handle.done:
+		case <-deadline:
+			return
+		}
 	}
 }
 
 func (r *Runner) IsRunning(name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, ok := r.cancel[name]
+	_, ok := r.runs[name]
 	return ok
 }
 
@@ -243,18 +258,22 @@ type appModel struct {
 	height    int
 	addMode   bool
 	addCursor int
+	addMarked map[string]bool
 	message   string
 }
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("45"))
 	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250"))
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("24"))
+	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Bold(true)
 	greenStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	yellowStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
 	redStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 	cyanStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Bold(true)
+	panelStyle    = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("238")).
+			Padding(0, 1)
 )
 
 func newAppModel(cfg Config, mon *Monitor, runner *Runner, initial []string) appModel {
@@ -308,36 +327,34 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor--
 			}
 		case "down", "j":
-			if m.cursor < len(m.services)-1 {
+			if m.cursor < len(m.activeNames())-1 {
 				m.cursor++
 			}
 		case "a":
 			m.addMode = true
 			m.addCursor = 0
+			m.addMarked = make(map[string]bool)
 			m.message = "select a service to start"
+		case "c":
+			m.mon.clearLogs()
+			m.message = "logs cleared"
 		case "s":
-			name := m.selectedService()
+			name := m.selectedActiveService()
 			if name != "" {
 				m.runner.Stop(name)
 				m.message = "stopping " + name
 			}
 		case "r":
-			name := m.selectedService()
+			name := m.selectedActiveService()
 			if name != "" {
 				m.runner.Restart(name)
 				m.message = "restarting " + name
 			}
 		case "enter":
-			name := m.selectedService()
+			name := m.selectedActiveService()
 			if name != "" {
-				if m.runner.IsRunning(name) {
-					m.runner.Stop(name)
-					m.message = "stopping " + name
-				} else if err := m.runner.Start(name); err != nil {
-					m.message = err.Error()
-				} else {
-					m.message = "starting " + name
-				}
+				m.runner.Stop(name)
+				m.message = "stopping " + name
 			}
 		}
 	}
@@ -360,14 +377,33 @@ func (m appModel) updateAddMode(key string) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if len(choices) > 0 {
-			name := choices[m.addCursor]
-			if err := m.runner.Start(name); err != nil {
-				m.message = err.Error()
-			} else {
-				m.message = "starting " + name
+			toStart := make([]string, 0)
+			for name, marked := range m.addMarked {
+				if marked {
+					toStart = append(toStart, name)
+				}
 			}
+			if len(toStart) == 0 {
+				toStart = append(toStart, choices[m.addCursor])
+			}
+			sort.Strings(toStart)
+			for _, name := range toStart {
+				if err := m.runner.Start(name); err != nil {
+					m.message = err.Error()
+					return m, nil
+				}
+			}
+			m.message = "starting " + strings.Join(toStart, ", ")
 		}
 		m.addMode = false
+	case " ":
+		if len(choices) > 0 {
+			name := choices[m.addCursor]
+			if m.addMarked == nil {
+				m.addMarked = make(map[string]bool)
+			}
+			m.addMarked[name] = !m.addMarked[name]
+		}
 	}
 	return m, nil
 }
@@ -381,21 +417,20 @@ func (m appModel) View() string {
 	if len(m.services) == 0 {
 		return "No services configured\n"
 	}
+	if m.cursor >= len(states) && len(states) > 0 {
+		m.cursor = len(states) - 1
+	}
 
 	var b strings.Builder
-	rule := strings.Repeat("─", max(48, min(m.width, 120)))
-	b.WriteString(titleStyle.Render("up") + mutedStyle.Render(" local dev monitor") + "\n")
-	b.WriteString(mutedStyle.Render(rule) + "\n")
-	b.WriteString(m.renderTable(stateByName))
-	b.WriteString("\n")
-	b.WriteString(headerStyle.Render("Logs") + mutedStyle.Render(" latest") + "\n")
-	b.WriteString(mutedStyle.Render(rule) + "\n")
-	b.WriteString(m.renderLogs(logs))
-	b.WriteString("\n")
 	if m.message != "" {
 		b.WriteString(cyanStyle.Render(m.message) + "\n")
 	}
-	b.WriteString(mutedStyle.Render("↑/↓ move • enter start/stop • a add • s stop • r restart • q quit") + "\n")
+	servicesPanel := m.panel(m.renderTable(stateByName))
+	helpPanel := m.panel(m.helpText())
+	logHeight := max(8, m.height-lipgloss.Height(servicesPanel)-lipgloss.Height(helpPanel)-4)
+	b.WriteString(servicesPanel + "\n")
+	b.WriteString(m.panelWithHeight(headerStyle.Render("Logs ")+mutedStyle.Render("focused/latest")+"\n"+m.renderLogs(logs), logHeight) + "\n")
+	b.WriteString(helpPanel + "\n")
 	if m.addMode {
 		b.WriteString("\n" + m.renderAddPicker())
 	}
@@ -406,9 +441,12 @@ func (m appModel) renderTable(stateByName map[string]RuntimeState) string {
 	compact := m.width < 88
 	var b strings.Builder
 	if compact {
-		b.WriteString(strings.Join([]string{padCell("SERVICE", 16), padCell("STATUS", 13), padCell("PORT", 8), "NEXT"}, " ") + "\n")
+		b.WriteString(headerStyle.Render("Active services") + "\n")
+		b.WriteString(strings.Join([]string{padCell("", 2), padCell("SERVICE", 16), padCell("STATUS", 13), padCell("PORT", 8), "NEXT"}, " ") + "\n")
 	} else {
+		b.WriteString(headerStyle.Render("Active services") + "\n")
 		b.WriteString(strings.Join([]string{
+			padCell("", 2),
 			padCell("SERVICE", 18),
 			padCell("STATUS", 13),
 			padCell("PID", 7),
@@ -418,17 +456,17 @@ func (m appModel) renderTable(stateByName map[string]RuntimeState) string {
 			"NEXT",
 		}, " ") + "\n")
 	}
-	b.WriteString(mutedStyle.Render(strings.Repeat("─", max(48, min(m.width, 120)))) + "\n")
-	for i, name := range m.services {
-		state := stateByName[name]
-		if state.Name == "" {
-			svc := m.cfg.Services[name]
-			state = RuntimeState{Name: name, Status: "stopped", Port: svc.Port, Command: svc.Command, CWD: svc.CWD}
-		}
-		line := m.renderStateLine(state, compact)
+	active := m.activeStatesFromMap(stateByName)
+	if len(active) == 0 {
+		b.WriteString(mutedStyle.Render("No active services. Press 'a' to start one.") + "\n")
+		return b.String()
+	}
+	for i, state := range active {
+		prefix := mutedStyle.Render(" ")
 		if i == m.cursor {
-			line = selectedStyle.Render(line)
+			prefix = selectedStyle.Render("▸")
 		}
+		line := prefix + " " + m.renderStateLine(state, compact)
 		b.WriteString(line + "\n")
 	}
 	return b.String()
@@ -509,13 +547,17 @@ func (m appModel) renderAddPicker() string {
 		return b.String()
 	}
 	for i, name := range choices {
-		line := "  " + name
+		mark := "[ ]"
+		if m.addMarked[name] {
+			mark = "[x]"
+		}
+		line := "  " + mark + " " + name
 		if i == m.addCursor {
-			line = selectedStyle.Render("> " + name)
+			line = selectedStyle.Render("▸ " + mark + " " + name)
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString(mutedStyle.Render("enter start • esc close") + "\n")
+	b.WriteString(mutedStyle.Render("space mark • enter start selected • esc close") + "\n")
 	return b.String()
 }
 
@@ -529,26 +571,48 @@ func (m appModel) availableServices() []string {
 	return out
 }
 
-func (m appModel) selectedService() string {
-	if m.cursor < 0 || m.cursor >= len(m.services) {
+func (m appModel) activeNames() []string {
+	states, _ := m.mon.snapshot()
+	names := make([]string, 0, len(states))
+	for _, state := range states {
+		names = append(names, state.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (m appModel) activeStatesFromMap(stateByName map[string]RuntimeState) []RuntimeState {
+	states := make([]RuntimeState, 0, len(stateByName))
+	for _, state := range stateByName {
+		states = append(states, state)
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
+	return states
+}
+
+func (m appModel) selectedActiveService() string {
+	names := m.activeNames()
+	if m.cursor < 0 || m.cursor >= len(names) {
 		return ""
 	}
-	return m.services[m.cursor]
+	return names[m.cursor]
 }
 
 func styledStatus(status string) string {
 	label := strings.ToUpper(status)
 	switch status {
 	case "running":
-		return greenStyle.Render(label)
+		return greenStyle.Render("● " + label)
 	case "starting", "restarting":
-		return yellowStyle.Render(label)
+		return yellowStyle.Render("◆ " + label)
 	case "crashed", "error":
-		return redStyle.Render(label)
+		return redStyle.Render("✕ " + label)
 	case "scheduled", "queued":
-		return cyanStyle.Render(label)
+		return cyanStyle.Render("◷ " + label)
+	case "stopping":
+		return yellowStyle.Render("■ " + label)
 	default:
-		return mutedStyle.Render(label)
+		return mutedStyle.Render("○ " + label)
 	}
 }
 
@@ -560,136 +624,25 @@ func padCell(value string, width int) string {
 	return value + strings.Repeat(" ", width-visible)
 }
 
-func (m *Monitor) renderLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	m.render()
-	for {
-		select {
-		case <-ctx.Done():
-			m.render()
-			return
-		case <-ticker.C:
-			m.render()
-		}
-	}
+func (m appModel) panel(content string) string {
+	width := max(48, m.width-2)
+	return panelStyle.Width(width).Render(strings.TrimRight(content, "\n"))
 }
 
-func (m *Monitor) render() {
-	width := terminalWidth()
-	compact := width < 86
-	ruleWidth := width
-	if ruleWidth > 120 {
-		ruleWidth = 120
-	}
-	if ruleWidth < 48 {
-		ruleWidth = 48
-	}
-
-	m.mu.Lock()
-	states := make([]RuntimeState, 0, len(m.states))
-	for _, state := range m.states {
-		states = append(states, state)
-	}
-	logs := append([]RuntimeLog(nil), m.logs...)
-	m.mu.Unlock()
-
-	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
-
-	fmt.Print("\033[2J\033[H")
-	fmt.Println(ansiBold + ansiCyan + "up" + ansiReset + ansiDim + " local dev monitor" + ansiReset)
-	fmt.Println(ansiGray + strings.Repeat("─", ruleWidth) + ansiReset)
-	if compact {
-		fmt.Printf("%-16s %-13s %-8s %s\n", "SERVICE", "STATUS", "PORT", "NEXT")
-	} else {
-		fmt.Printf("%-18s %-13s %-7s %-8s %-10s %-9s %s\n", "SERVICE", "STATUS", "PID", "PORT", "UPTIME", "RESTARTS", "NEXT")
-	}
-	fmt.Println(ansiGray + strings.Repeat("─", ruleWidth) + ansiReset)
-	for _, state := range states {
-		pid := "-"
-		if state.PID > 0 {
-			pid = strconv.Itoa(state.PID)
-		}
-		portText := "-"
-		portVisible := 1
-		if state.Port > 0 {
-			portText = terminalLink("http://localhost:"+strconv.Itoa(state.Port), strconv.Itoa(state.Port))
-			portVisible = len(strconv.Itoa(state.Port))
-		}
-		uptime := "-"
-		if !state.StartedAt.IsZero() && state.PID > 0 {
-			uptime = shortDuration(time.Since(state.StartedAt))
-		}
-		next := "-"
-		if !state.NextRun.IsZero() {
-			next = state.NextRun.Format("15:04:05")
-		}
-		if compact {
-			fmt.Printf("%s %s %s %s\n",
-				cell(truncate(state.Name, 16), 16),
-				colorStatus(state.Status),
-				ansiCell(portText, portVisible, 8),
-				next,
-			)
-		} else {
-			fmt.Printf("%s %s %s %s %s %s %s\n",
-				cell(truncate(state.Name, 18), 18),
-				colorStatus(state.Status),
-				cell(pid, 7),
-				ansiCell(portText, portVisible, 8),
-				cell(uptime, 10),
-				cell(strconv.Itoa(state.Restarts), 9),
-				next,
-			)
-		}
-		if state.LastExit != "" {
-			fmt.Println("  " + ansiDim + truncate(state.LastExit, ruleWidth-4) + ansiReset)
-		}
-	}
-	fmt.Println()
-	fmt.Println(ansiBold + "Logs" + ansiReset + ansiDim + " (latest)" + ansiReset)
-	fmt.Println(ansiGray + strings.Repeat("─", ruleWidth) + ansiReset)
-	if len(logs) == 0 {
-		fmt.Println(ansiDim + "No logs yet" + ansiReset)
-	} else {
-		msgWidth := ruleWidth - 30
-		if msgWidth < 20 {
-			msgWidth = 20
-		}
-		for _, entry := range logs {
-			stream := entry.Stream
-			if stream == "err" {
-				stream = ansiRed + stream + ansiReset
-			} else {
-				stream = ansiBlue + stream + ansiReset
-			}
-			fmt.Printf("%s %-16s %-12s %s\n",
-				ansiGray+entry.Time.Format("15:04:05")+ansiReset,
-				"["+truncate(entry.Service, 14)+"]",
-				stream,
-				truncate(entry.Message, msgWidth),
-			)
-		}
-	}
-	fmt.Println()
-	fmt.Println(ansiDim + "Ctrl+C stops all running services" + ansiReset)
+func (m appModel) panelWithHeight(content string, height int) string {
+	width := max(48, m.width-2)
+	return panelStyle.Width(width).Height(height).Render(strings.TrimRight(content, "\n"))
 }
 
-func colorStatus(status string) string {
-	color := ansiGray
-	switch status {
-	case "running":
-		color = ansiGreen
-	case "starting", "restarting":
-		color = ansiYellow
-	case "crashed", "error":
-		color = ansiRed
-	case "scheduled", "queued":
-		color = ansiCyan
-	case "stopped":
-		color = ansiDim
-	}
-	return color + fmt.Sprintf("%-13s", strings.ToUpper(status)) + ansiReset
+func (m appModel) helpText() string {
+	return strings.Join([]string{
+		mutedStyle.Render("↑/↓") + " move",
+		mutedStyle.Render("a") + " add",
+		mutedStyle.Render("c") + " clear logs",
+		mutedStyle.Render("enter/s") + " stop",
+		mutedStyle.Render("r") + " restart",
+		mutedStyle.Render("q") + " quit",
+	}, "   ")
 }
 
 func shortDuration(d time.Duration) string {
@@ -702,38 +655,11 @@ func shortDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
-func terminalWidth() int {
-	width, _, err := term.GetSize(int(os.Stdout.Fd()))
-	if err == nil && width > 0 {
-		return width
-	}
-	if value := strings.TrimSpace(os.Getenv("COLUMNS")); value != "" {
-		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
-			return parsed
-		}
-	}
-	return 100
-}
-
 func terminalLink(url, label string) string {
 	if os.Getenv("UP_NO_LINKS") == "1" {
 		return label
 	}
 	return "\033]8;;" + url + "\033\\" + label + "\033]8;;\033\\"
-}
-
-func cell(value string, width int) string {
-	if len(value) >= width {
-		return value
-	}
-	return value + strings.Repeat(" ", width-len(value))
-}
-
-func ansiCell(value string, visibleWidth, width int) string {
-	if visibleWidth >= width {
-		return value
-	}
-	return value + strings.Repeat(" ", width-visibleWidth)
 }
 
 func main() {
@@ -1102,19 +1028,18 @@ func cmdRun(args []string) error {
 		return errors.New("nothing to run")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	allNames := make([]string, 0, len(cfg.Services))
-	for name := range cfg.Services {
-		allNames = append(allNames, name)
-	}
-	sort.Strings(allNames)
-
-	mon := newMonitor(allNames, cfg)
+	mon := newMonitor(names, cfg)
 	runner := newRunner(ctx, cfg, mon)
 	model := newAppModel(cfg, mon, runner, names)
-	program := tea.NewProgram(model, tea.WithAltScreen())
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithoutSignalHandler())
+	go func() {
+		<-ctx.Done()
+		runner.StopAll()
+		program.Quit()
+	}()
 	_, err = program.Run()
 	runner.StopAll()
 	cancel()
@@ -1248,9 +1173,15 @@ func runOnce(ctx context.Context, mon *Monitor, name string, svc Service) (int, 
 	go func() {
 		<-ctx.Done()
 		killProcessTree(cmd.Process.Pid)
+		mon.addLog(name, "sys", fmt.Sprintf("killed process tree pid=%d", cmd.Process.Pid))
 		if svc.Port > 0 {
 			time.Sleep(500 * time.Millisecond)
-			killListenersOnPort(svc.Port)
+			pids := killListenersOnPort(svc.Port)
+			if len(pids) > 0 {
+				mon.addLog(name, "sys", fmt.Sprintf("killed listener(s) on port %d: %v", svc.Port, pids))
+			} else {
+				mon.addLog(name, "sys", fmt.Sprintf("port %d released", svc.Port))
+			}
 		}
 	}()
 
@@ -1291,10 +1222,6 @@ func streamLines(wg *sync.WaitGroup, mon *Monitor, name string, r io.Reader, isE
 		}
 		mon.addLog(name, prefix, scanner.Text())
 	}
-}
-
-func logLine(name, msg string) {
-	fmt.Printf("%s %-16s %s\n", time.Now().Format("15:04:05"), "["+name+"]", msg)
 }
 
 func resolveTargets(cfg Config, target string) ([]string, error) {
