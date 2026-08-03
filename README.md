@@ -100,6 +100,15 @@ The monitor shows:
 - restart count
 - next scheduled run
 - recent logs
+- runtime controls for starting and stopping services
+
+Keys:
+
+- `a` opens the service picker and starts another configured service.
+- `enter` starts or stops the selected service.
+- `s` stops the selected service.
+- `r` restarts the selected service.
+- `q` quits and stops all running services.
 
 If a service has a port, terminals that support OSC 8 hyperlinks can open
 `http://localhost:<port>` directly from the dashboard.
