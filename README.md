@@ -1,57 +1,135 @@
 # up
 
-`up` is a small local development command supervisor. It runs any long-lived
-command, shows a colored terminal monitor, streams logs, restarts crashed
-processes, supports simple schedules, and shows optional metadata such as the
-localhost port.
+Bring your local development stack up with one command.
 
-It is intentionally separate from `pf`: no kubectl, no port-forward assumptions,
-and no required health check.
+`up` is a terminal-based supervisor for local developer tools and services. It
+starts the commands you normally run by hand, keeps long-running processes alive,
+shows a responsive colored monitor, streams recent logs, and can start services
+on a simple schedule.
 
-## Build
+Use it for anything you run during development:
 
-Install globally with Go:
+- frontend dev servers
+- backend APIs
+- Python or Go workers
+- batch files and shell scripts
+- Docker Compose commands
+- recurring local jobs
 
-```powershell
+No health endpoint is required. A port is optional metadata used for display and
+clickable localhost links.
+
+## Install
+
+```bash
 go install github.com/alinemone/up@latest
 ```
 
-Make sure Go's bin directory is in your `PATH`:
+Make sure Go's bin directory is in your `PATH`.
+
+Linux/macOS:
+
+```bash
+echo 'export PATH="$PATH:$HOME/go/bin"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Windows PowerShell:
 
 ```powershell
-go env GOPATH
+$env:Path += ";$(go env GOPATH)\bin"
 ```
 
-The executable is installed under:
+Check the installed version:
 
-```text
-<GOPATH>\bin\up.exe
+```bash
+up version
 ```
 
-Build locally:
+## Quick Start
 
-```powershell
-go build -o up.exe .
+Add a service:
+
+```bash
+up add api --cwd ~/projects/api --port 8080 "npm run dev"
 ```
 
-## Examples
+Run it:
+
+```bash
+up api
+```
+
+Add a few services and run them together:
+
+```bash
+up add web --cwd ~/projects/web --port 5173 "npm run dev"
+up add worker --cwd ~/projects/worker "go run ./cmd/worker"
+
+up group add dev api web worker
+up run dev
+```
+
+## Windows Examples
 
 ```powershell
 up add claude-web --cwd F:\projects\claude-web --port 8766 --env PYTHONUTF8=1 --env PYTHONIOENCODING=utf-8 "uv run python main.py"
+
 up add front --cwd F:\projects\front --port 5173 "npm run dev"
-up add backup-job --every 2h --no-restart "powershell -File F:\jobs\backup.ps1"
-up add morning-api --at 09:00 --cwd F:\projects\api --port 8080 "npm run dev"
 
-up group add morning claude-web front
-up run morning
+up add claude-web-bat --port 8766 "call F:\projects\claude-web\dev.bat"
 ```
 
-You can also run a batch file:
+## Monitor
 
-```powershell
-up add claude-web --port 8766 "call F:\projects\claude-web\dev.bat"
-up claude-web
+`up run ...` opens a responsive terminal dashboard:
+
+```text
+SERVICE            STATUS        PID     PORT     UPTIME     RESTARTS  NEXT
+api                RUNNING       18420   8080     12m04s     0         -
+web                RUNNING       18712   5173     11m51s     1         -
+backup             SCHEDULED     -       -        -          0         14:00:00
 ```
+
+The monitor shows:
+
+- current status
+- process ID
+- optional localhost port
+- uptime
+- restart count
+- next scheduled run
+- recent logs
+
+If a service has a port, terminals that support OSC 8 hyperlinks can open
+`http://localhost:<port>` directly from the dashboard.
+
+Disable terminal links:
+
+```bash
+UP_NO_LINKS=1 up run all
+```
+
+## Scheduling
+
+Start a service at a daily time:
+
+```bash
+up add morning-api --at 09:00 --cwd ~/projects/api --port 8080 "npm run dev"
+```
+
+Run a repeated job:
+
+```bash
+up add backup --every 2h --no-restart "bash ~/jobs/backup.sh"
+```
+
+Schedule options:
+
+- `--at HH:MM` starts at the next daily time.
+- `--every 30m`, `--every 2h`, or `--every 1h30m` starts after that interval.
+- With `--restart` enabled, the process is kept alive after it starts.
+- With `--no-restart`, `--every` behaves like a repeated job interval.
 
 ## Commands
 
@@ -66,7 +144,15 @@ up group delete <group>
 up version
 ```
 
-## Config
+Shortcuts:
+
+```bash
+up api
+up api,web
+up all
+```
+
+## Configuration
 
 Config is stored at:
 
@@ -74,46 +160,27 @@ Config is stored at:
 ~/.up/services.json
 ```
 
-Shape:
+Example:
 
 ```json
 {
   "services": {
-    "claude-web": {
-      "cwd": "F:\\projects\\claude-web",
-      "command": "uv run python main.py",
-      "port": 8766,
-      "env": {
-        "PYTHONUTF8": "1",
-        "PYTHONIOENCODING": "utf-8"
-      },
-      "restart": true,
+    "api": {
+      "cwd": "/home/ali/projects/api",
+      "command": "npm run dev",
+      "port": 8080,
+      "restart": true
+    },
+    "backup": {
+      "command": "bash /home/ali/jobs/backup.sh",
+      "restart": false,
       "schedule": {
-        "at": "09:00",
         "every": "2h"
       }
     }
   },
   "groups": {
-    "morning": ["claude-web"]
+    "dev": ["api"]
   }
 }
 ```
-
-## Scheduling
-
-`schedule.at` runs the service at the next daily `HH:MM`.
-`schedule.every` runs it after the given Go duration (`30m`, `2h`, `1h30m`).
-
-If a scheduled service has `restart: true`, it is kept alive after its scheduled
-start. If it has `restart: false`, `every` behaves like a repeated job interval.
-
-## Monitor
-
-`up run ...` opens a responsive colored terminal dashboard with service status,
-PID, port, uptime, restart count, next scheduled run, and recent logs.
-
-When a service has a port, terminals that support OSC 8 hyperlinks can open it
-directly from the dashboard as `http://localhost:<port>`.
-
-Set `UP_NO_LINKS=1` to disable terminal hyperlinks.
