@@ -1,6 +1,6 @@
-# devkeep
+# up
 
-`devkeep` is a small local development command supervisor. It runs any long-lived
+`up` is a small local development command supervisor. It runs any long-lived
 command, streams logs, restarts crashed processes, and shows optional metadata
 such as the localhost port.
 
@@ -12,7 +12,7 @@ and no required health check.
 Install globally with Go:
 
 ```powershell
-go install github.com/alinemone/devkeep@latest
+go install github.com/alinemone/up@latest
 ```
 
 Make sure Go's bin directory is in your `PATH`:
@@ -24,42 +24,42 @@ go env GOPATH
 The executable is installed under:
 
 ```text
-<GOPATH>\bin\devkeep.exe
+<GOPATH>\bin\up.exe
 ```
 
 Build locally:
 
 ```powershell
-go build -o devkeep.exe .
+go build -o up.exe .
 ```
 
 ## Examples
 
 ```powershell
-devkeep add claude-web --cwd F:\projects\claude-web --port 8766 --env PYTHONUTF8=1 --env PYTHONIOENCODING=utf-8 "uv run python main.py"
-devkeep add front --cwd F:\projects\front --port 5173 "npm run dev"
+up add claude-web --cwd F:\projects\claude-web --port 8766 --env PYTHONUTF8=1 --env PYTHONIOENCODING=utf-8 "uv run python main.py"
+up add front --cwd F:\projects\front --port 5173 "npm run dev"
 
-devkeep group add morning claude-web front
-devkeep run morning
+up group add morning claude-web front
+up run morning
 ```
 
 You can also run a batch file:
 
 ```powershell
-devkeep add claude-web --port 8766 "call F:\projects\claude-web\dev.bat"
-devkeep claude-web
+up add claude-web --port 8766 "call F:\projects\claude-web\dev.bat"
+up claude-web
 ```
 
 ## Commands
 
 ```text
-devkeep add <name> [--cwd <path>] [--port <port>] [--env KEY=VALUE] <command>
-devkeep run <name|group|all>[,<name|group>...]
-devkeep list
-devkeep delete <name>
-devkeep group add <group> <service...>
-devkeep group remove <group> <service...>
-devkeep group delete <group>
+up add <name> [--cwd <path>] [--port <port>] [--env KEY=VALUE] <command>
+up run <name|group|all>[,<name|group>...]
+up list
+up delete <name>
+up group add <group> <service...>
+up group remove <group> <service...>
+up group delete <group>
 ```
 
 ## Config
@@ -67,7 +67,7 @@ devkeep group delete <group>
 Config is stored at:
 
 ```text
-~/.devkeep/services.json
+~/.up/services.json
 ```
 
 Shape:

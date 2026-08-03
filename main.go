@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const appName = "devkeep"
+const appName = "up"
 
 type Config struct {
 	Services map[string]Service  `json:"services"`
@@ -68,27 +68,27 @@ func run(args []string) error {
 }
 
 func printUsage() {
-	fmt.Println(`devkeep - local dev command supervisor
+	fmt.Println(`up - local dev command supervisor
 
 Usage:
-  devkeep add <name> [--cwd <path>] [--port <port>] [--env KEY=VALUE] <command>
-  devkeep run <name|group|all>[,<name|group>...]
-  devkeep list
-  devkeep delete <name>
-  devkeep group add <group> <service...>
-  devkeep group remove <group> <service...>
-  devkeep group delete <group>
+  up add <name> [--cwd <path>] [--port <port>] [--env KEY=VALUE] <command>
+  up run <name|group|all>[,<name|group>...]
+  up list
+  up delete <name>
+  up group add <group> <service...>
+  up group remove <group> <service...>
+  up group delete <group>
 
 Examples:
-  devkeep add claude-web --cwd F:\projects\claude-web --port 8766 "uv run python main.py"
-  devkeep add front --cwd F:\projects\front --port 5173 "npm run dev"
-  devkeep group add morning claude-web front
-  devkeep run morning`)
+  up add claude-web --cwd F:\projects\claude-web --port 8766 "uv run python main.py"
+  up add front --cwd F:\projects\front --port 5173 "npm run dev"
+  up group add morning claude-web front
+  up run morning`)
 }
 
 func cmdAdd(args []string) error {
 	if len(args) < 2 {
-		return errors.New("usage: devkeep add <name> [--cwd <path>] [--port <port>] <command>")
+		return errors.New("usage: up add <name> [--cwd <path>] [--port <port>] <command>")
 	}
 
 	name := args[0]
@@ -238,7 +238,7 @@ func cmdList() error {
 
 func cmdDelete(args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: devkeep delete <name>")
+		return errors.New("usage: up delete <name>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -261,24 +261,24 @@ func cmdDelete(args []string) error {
 
 func cmdGroup(args []string) error {
 	if len(args) < 1 {
-		return errors.New("usage: devkeep group <add|remove|delete|list> ...")
+		return errors.New("usage: up group <add|remove|delete|list> ...")
 	}
 	switch args[0] {
 	case "list", "ls", "l":
 		return cmdList()
 	case "add", "a":
 		if len(args) < 3 {
-			return errors.New("usage: devkeep group add <group> <service...>")
+			return errors.New("usage: up group add <group> <service...>")
 		}
 		return updateGroup(args[1], args[2:], true)
 	case "remove", "rm", "r":
 		if len(args) < 3 {
-			return errors.New("usage: devkeep group remove <group> <service...>")
+			return errors.New("usage: up group remove <group> <service...>")
 		}
 		return updateGroup(args[1], args[2:], false)
 	case "delete", "del", "d":
 		if len(args) != 2 {
-			return errors.New("usage: devkeep group delete <group>")
+			return errors.New("usage: up group delete <group>")
 		}
 		cfg, err := loadConfig()
 		if err != nil {
@@ -331,7 +331,7 @@ func updateGroup(group string, services []string, add bool) error {
 
 func cmdRun(args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: devkeep run <name|group|all>[,<name|group>...]")
+		return errors.New("usage: up run <name|group|all>[,<name|group>...]")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
