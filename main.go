@@ -27,11 +27,210 @@ type Config struct {
 }
 
 type Service struct {
-	CWD     string            `json:"cwd,omitempty"`
-	Command string            `json:"command"`
-	Port    int               `json:"port,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	Restart bool              `json:"restart"`
+	CWD      string            `json:"cwd,omitempty"`
+	Command  string            `json:"command"`
+	Port     int               `json:"port,omitempty"`
+	Env      map[string]string `json:"env,omitempty"`
+	Restart  bool              `json:"restart"`
+	Schedule Schedule          `json:"schedule,omitempty"`
+}
+
+type Schedule struct {
+	At    string `json:"at,omitempty"`
+	Every string `json:"every,omitempty"`
+}
+
+type RuntimeState struct {
+	Name      string
+	Status    string
+	PID       int
+	Port      int
+	Command   string
+	CWD       string
+	StartedAt time.Time
+	NextRun   time.Time
+	Restarts  int
+	LastExit  string
+}
+
+type RuntimeLog struct {
+	Time    time.Time
+	Service string
+	Stream  string
+	Message string
+}
+
+type Monitor struct {
+	mu     sync.Mutex
+	states map[string]RuntimeState
+	logs   []RuntimeLog
+}
+
+const maxLogs = 14
+
+const (
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiDim    = "\033[2m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiRed    = "\033[31m"
+	ansiCyan   = "\033[36m"
+	ansiBlue   = "\033[34m"
+	ansiGray   = "\033[90m"
+)
+
+func newMonitor(names []string, cfg Config) *Monitor {
+	m := &Monitor{states: make(map[string]RuntimeState)}
+	for _, name := range names {
+		svc := cfg.Services[name]
+		m.states[name] = RuntimeState{
+			Name:    name,
+			Status:  "queued",
+			Port:    svc.Port,
+			Command: svc.Command,
+			CWD:     svc.CWD,
+		}
+	}
+	return m
+}
+
+func (m *Monitor) update(name string, fn func(*RuntimeState)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state := m.states[name]
+	if state.Name == "" {
+		state.Name = name
+	}
+	fn(&state)
+	m.states[name] = state
+}
+
+func (m *Monitor) addLog(name, stream, message string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logs = append(m.logs, RuntimeLog{
+		Time:    time.Now(),
+		Service: name,
+		Stream:  stream,
+		Message: message,
+	})
+	if len(m.logs) > maxLogs {
+		m.logs = append([]RuntimeLog(nil), m.logs[len(m.logs)-maxLogs:]...)
+	}
+}
+
+func (m *Monitor) renderLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	m.render()
+	for {
+		select {
+		case <-ctx.Done():
+			m.render()
+			return
+		case <-ticker.C:
+			m.render()
+		}
+	}
+}
+
+func (m *Monitor) render() {
+	m.mu.Lock()
+	states := make([]RuntimeState, 0, len(m.states))
+	for _, state := range m.states {
+		states = append(states, state)
+	}
+	logs := append([]RuntimeLog(nil), m.logs...)
+	m.mu.Unlock()
+
+	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
+
+	fmt.Print("\033[2J\033[H")
+	fmt.Println(ansiBold + ansiCyan + "up" + ansiReset + ansiDim + " local dev monitor" + ansiReset)
+	fmt.Println(ansiGray + strings.Repeat("─", 96) + ansiReset)
+	fmt.Printf("%-18s %-13s %-7s %-8s %-10s %-9s %s\n", "SERVICE", "STATUS", "PID", "PORT", "UPTIME", "RESTARTS", "NEXT")
+	fmt.Println(ansiGray + strings.Repeat("─", 96) + ansiReset)
+	for _, state := range states {
+		pid := "-"
+		if state.PID > 0 {
+			pid = strconv.Itoa(state.PID)
+		}
+		port := "-"
+		if state.Port > 0 {
+			port = strconv.Itoa(state.Port)
+		}
+		uptime := "-"
+		if !state.StartedAt.IsZero() && state.PID > 0 {
+			uptime = shortDuration(time.Since(state.StartedAt))
+		}
+		next := "-"
+		if !state.NextRun.IsZero() {
+			next = state.NextRun.Format("15:04:05")
+		}
+		fmt.Printf("%-18s %-22s %-7s %-8s %-10s %-9d %s\n",
+			truncate(state.Name, 18),
+			colorStatus(state.Status),
+			pid,
+			port,
+			uptime,
+			state.Restarts,
+			next,
+		)
+		if state.LastExit != "" {
+			fmt.Println("  " + ansiDim + truncate(state.LastExit, 92) + ansiReset)
+		}
+	}
+	fmt.Println()
+	fmt.Println(ansiBold + "Logs" + ansiReset + ansiDim + " (latest)" + ansiReset)
+	fmt.Println(ansiGray + strings.Repeat("─", 96) + ansiReset)
+	if len(logs) == 0 {
+		fmt.Println(ansiDim + "No logs yet" + ansiReset)
+	} else {
+		for _, entry := range logs {
+			stream := entry.Stream
+			if stream == "err" {
+				stream = ansiRed + stream + ansiReset
+			} else {
+				stream = ansiBlue + stream + ansiReset
+			}
+			fmt.Printf("%s %-16s %-12s %s\n",
+				ansiGray+entry.Time.Format("15:04:05")+ansiReset,
+				"["+truncate(entry.Service, 14)+"]",
+				stream,
+				truncate(entry.Message, 70),
+			)
+		}
+	}
+	fmt.Println()
+	fmt.Println(ansiDim + "Ctrl+C stops all running services" + ansiReset)
+}
+
+func colorStatus(status string) string {
+	color := ansiGray
+	switch status {
+	case "running":
+		color = ansiGreen
+	case "starting", "restarting":
+		color = ansiYellow
+	case "crashed", "error":
+		color = ansiRed
+	case "scheduled", "queued":
+		color = ansiCyan
+	case "stopped":
+		color = ansiDim
+	}
+	return color + fmt.Sprintf("%-13s", strings.ToUpper(status)) + ansiReset
+}
+
+func shortDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
 func main() {
@@ -70,7 +269,7 @@ func printUsage() {
 	fmt.Println(`up - local dev command supervisor
 
 Usage:
-  up add <name> [--cwd <path>] [--port <port>] [--env KEY=VALUE] <command>
+  up add <name> [--cwd <path>] [--port <port>] [--env KEY=VALUE] [--at HH:MM] [--every 2h] <command>
   up run <name|group|all>[,<name|group>...]
   up list
   up delete <name>
@@ -99,6 +298,7 @@ func cmdAdd(args []string) error {
 	port := 0
 	restart := true
 	env := envFlags{}
+	schedule := Schedule{}
 	i := 1
 	for i < len(args) {
 		arg := args[i]
@@ -147,6 +347,22 @@ func cmdAdd(args []string) error {
 			if err := env.Set(strings.TrimPrefix(arg, "--env=")); err != nil {
 				return err
 			}
+		case arg == "--at":
+			i++
+			if i >= len(args) {
+				return errors.New("--at requires HH:MM")
+			}
+			schedule.At = args[i]
+		case strings.HasPrefix(arg, "--at="):
+			schedule.At = strings.TrimPrefix(arg, "--at=")
+		case arg == "--every":
+			i++
+			if i >= len(args) {
+				return errors.New("--every requires a duration like 2h or 30m")
+			}
+			schedule.Every = args[i]
+		case strings.HasPrefix(arg, "--every="):
+			schedule.Every = strings.TrimPrefix(arg, "--every=")
 		case arg == "--restart":
 			restart = true
 		case arg == "--no-restart":
@@ -170,17 +386,21 @@ func cmdAdd(args []string) error {
 	if strings.TrimSpace(command) == "" {
 		return errors.New("command is required")
 	}
+	if err := validateSchedule(schedule); err != nil {
+		return err
+	}
 
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
 	cfg.Services[name] = Service{
-		CWD:     strings.TrimSpace(cwd),
-		Command: command,
-		Port:    port,
-		Env:     env.values,
-		Restart: restart,
+		CWD:      strings.TrimSpace(cwd),
+		Command:  command,
+		Port:     port,
+		Env:      env.values,
+		Restart:  restart,
+		Schedule: schedule,
 	}
 	if err := saveConfig(cfg); err != nil {
 		return err
@@ -206,18 +426,19 @@ func cmdList() error {
 	}
 	sort.Strings(names)
 
-	fmt.Printf("%-18s %-7s %-32s %s\n", "NAME", "PORT", "CWD", "COMMAND")
+	fmt.Printf("%-18s %-7s %-14s %-32s %s\n", "NAME", "PORT", "SCHEDULE", "CWD", "COMMAND")
 	for _, name := range names {
 		s := cfg.Services[name]
 		port := "-"
 		if s.Port > 0 {
 			port = strconv.Itoa(s.Port)
 		}
+		schedule := scheduleLabel(s.Schedule)
 		cwd := s.CWD
 		if cwd == "" {
 			cwd = "."
 		}
-		fmt.Printf("%-18s %-7s %-32s %s\n", name, port, truncate(cwd, 32), s.Command)
+		fmt.Printf("%-18s %-7s %-14s %-32s %s\n", name, port, schedule, truncate(cwd, 32), s.Command)
 	}
 
 	if len(cfg.Groups) > 0 {
@@ -347,7 +568,8 @@ func cmdRun(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	fmt.Printf("Running %s. Press Ctrl+C to stop.\n", strings.Join(names, ", "))
+	mon := newMonitor(names, cfg)
+	go mon.renderLoop(ctx)
 
 	var wg sync.WaitGroup
 	for _, name := range names {
@@ -355,14 +577,63 @@ func cmdRun(args []string) error {
 		wg.Add(1)
 		go func(name string, svc Service) {
 			defer wg.Done()
-			supervise(ctx, name, svc)
+			supervise(ctx, mon, name, svc)
 		}(name, svc)
 	}
 	wg.Wait()
+	mon.render()
 	return nil
 }
 
-func supervise(ctx context.Context, name string, svc Service) {
+func supervise(ctx context.Context, mon *Monitor, name string, svc Service) {
+	if svc.Schedule.At != "" || svc.Schedule.Every != "" {
+		superviseScheduled(ctx, mon, name, svc)
+		return
+	}
+	superviseNow(ctx, mon, name, svc)
+}
+
+func superviseScheduled(ctx context.Context, mon *Monitor, name string, svc Service) {
+	for {
+		next, err := nextScheduledRun(svc.Schedule, time.Now())
+		if err != nil {
+			mon.update(name, func(state *RuntimeState) {
+				state.Status = "error"
+				state.LastExit = err.Error()
+			})
+			return
+		}
+		mon.update(name, func(state *RuntimeState) {
+			state.Status = "scheduled"
+			state.NextRun = next
+		})
+		mon.addLog(name, "sys", "scheduled for "+next.Format("2006-01-02 15:04:05"))
+
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		if svc.Restart {
+			superviseNow(ctx, mon, name, svc)
+			return
+		}
+
+		_, _ = runOnce(ctx, mon, name, svc)
+		if svc.Schedule.Every == "" {
+			mon.update(name, func(state *RuntimeState) {
+				state.Status = "stopped"
+				state.NextRun = time.Time{}
+			})
+			return
+		}
+	}
+}
+
+func superviseNow(ctx context.Context, mon *Monitor, name string, svc Service) {
 	attempt := 0
 	for {
 		if ctx.Err() != nil {
@@ -371,18 +642,35 @@ func supervise(ctx context.Context, name string, svc Service) {
 		attempt++
 		status := "starting"
 		if attempt > 1 {
-			status = fmt.Sprintf("restarting attempt=%d", attempt)
+			status = "restarting"
 		}
-		logLine(name, status)
+		mon.update(name, func(state *RuntimeState) {
+			state.Status = status
+			state.NextRun = time.Time{}
+			if attempt > 1 {
+				state.Restarts = attempt - 1
+			}
+		})
+		mon.addLog(name, "sys", status)
 
-		exitCode, err := runOnce(ctx, name, svc)
+		exitCode, err := runOnce(ctx, mon, name, svc)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
-			logLine(name, fmt.Sprintf("crashed exit=%d error=%v", exitCode, err))
+			mon.update(name, func(state *RuntimeState) {
+				state.Status = "crashed"
+				state.PID = 0
+				state.LastExit = fmt.Sprintf("exit=%d error=%v", exitCode, err)
+			})
+			mon.addLog(name, "sys", fmt.Sprintf("crashed exit=%d error=%v", exitCode, err))
 		} else {
-			logLine(name, fmt.Sprintf("stopped exit=%d", exitCode))
+			mon.update(name, func(state *RuntimeState) {
+				state.Status = "stopped"
+				state.PID = 0
+				state.LastExit = fmt.Sprintf("exit=%d", exitCode)
+			})
+			mon.addLog(name, "sys", fmt.Sprintf("stopped exit=%d", exitCode))
 		}
 		if !svc.Restart {
 			return
@@ -396,7 +684,7 @@ func supervise(ctx context.Context, name string, svc Service) {
 	}
 }
 
-func runOnce(ctx context.Context, name string, svc Service) (int, error) {
+func runOnce(ctx context.Context, mon *Monitor, name string, svc Service) (int, error) {
 	cmd := shellCommand(ctx, svc.Command)
 	if svc.CWD != "" {
 		cmd.Dir = svc.CWD
@@ -415,6 +703,10 @@ func runOnce(ctx context.Context, name string, svc Service) (int, error) {
 		return -1, err
 	}
 	if err := cmd.Start(); err != nil {
+		mon.update(name, func(state *RuntimeState) {
+			state.Status = "error"
+			state.LastExit = err.Error()
+		})
 		return -1, err
 	}
 	go func() {
@@ -422,16 +714,19 @@ func runOnce(ctx context.Context, name string, svc Service) (int, error) {
 		killProcessTree(cmd.Process.Pid)
 	}()
 
-	port := ""
-	if svc.Port > 0 {
-		port = fmt.Sprintf(" localhost:%d", svc.Port)
-	}
-	logLine(name, fmt.Sprintf("running pid=%d%s", cmd.Process.Pid, port))
+	mon.update(name, func(state *RuntimeState) {
+		state.Status = "running"
+		state.PID = cmd.Process.Pid
+		state.Port = svc.Port
+		state.StartedAt = time.Now()
+		state.LastExit = ""
+	})
+	mon.addLog(name, "sys", fmt.Sprintf("running pid=%d", cmd.Process.Pid))
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go streamLines(&wg, name, stdout, false)
-	go streamLines(&wg, name, stderr, true)
+	go streamLines(&wg, mon, name, stdout, false)
+	go streamLines(&wg, mon, name, stderr, true)
 
 	err = cmd.Wait()
 	wg.Wait()
@@ -444,7 +739,7 @@ func runOnce(ctx context.Context, name string, svc Service) (int, error) {
 	return -1, err
 }
 
-func streamLines(wg *sync.WaitGroup, name string, r io.Reader, isErr bool) {
+func streamLines(wg *sync.WaitGroup, mon *Monitor, name string, r io.Reader, isErr bool) {
 	defer wg.Done()
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 0, 64*1024)
@@ -454,7 +749,7 @@ func streamLines(wg *sync.WaitGroup, name string, r io.Reader, isErr bool) {
 		if isErr {
 			prefix = "err"
 		}
-		logLine(name, prefix+" "+scanner.Text())
+		mon.addLog(name, prefix, scanner.Text())
 	}
 }
 
@@ -574,6 +869,79 @@ func validateName(name string) error {
 		}
 	}
 	return nil
+}
+
+func validateSchedule(schedule Schedule) error {
+	if schedule.At != "" {
+		if _, err := parseClock(schedule.At, time.Now()); err != nil {
+			return fmt.Errorf("--at: %w", err)
+		}
+	}
+	if schedule.Every != "" {
+		if _, err := time.ParseDuration(schedule.Every); err != nil {
+			return fmt.Errorf("--every: %w", err)
+		}
+	}
+	return nil
+}
+
+func scheduleLabel(schedule Schedule) string {
+	switch {
+	case schedule.At != "" && schedule.Every != "":
+		return schedule.At + "/" + schedule.Every
+	case schedule.At != "":
+		return "at " + schedule.At
+	case schedule.Every != "":
+		return "every " + schedule.Every
+	default:
+		return "-"
+	}
+}
+
+func parseClock(value string, now time.Time) (time.Time, error) {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return time.Time{}, errors.New("expected HH:MM")
+	}
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil || hour < 0 || hour > 23 {
+		return time.Time{}, errors.New("hour must be 00..23")
+	}
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil || minute < 0 || minute > 59 {
+		return time.Time{}, errors.New("minute must be 00..59")
+	}
+	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
+	}
+	return next, nil
+}
+
+func nextScheduledRun(schedule Schedule, now time.Time) (time.Time, error) {
+	var candidates []time.Time
+	if schedule.At != "" {
+		next, err := parseClock(schedule.At, now)
+		if err != nil {
+			return time.Time{}, err
+		}
+		candidates = append(candidates, next)
+	}
+	if schedule.Every != "" {
+		duration, err := time.ParseDuration(schedule.Every)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if duration <= 0 {
+			return time.Time{}, errors.New("duration must be positive")
+		}
+		candidates = append(candidates, now.Add(duration))
+	}
+	if len(candidates) == 0 {
+		return now, nil
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Before(candidates[j]) })
+	return candidates[0], nil
 }
 
 func truncate(s string, max int) string {
