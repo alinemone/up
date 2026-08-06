@@ -64,6 +64,7 @@ type RuntimeLog struct {
 	Service string
 	Stream  string
 	Message string
+	Count   int
 }
 
 type Monitor struct {
@@ -72,7 +73,11 @@ type Monitor struct {
 	logs   []RuntimeLog
 }
 
-const maxLogs = 14
+const maxLogs = 1000
+const restartDelay = 2 * time.Second
+const crashLoopWindow = 30 * time.Second
+const crashLoopLimit = 10
+const crashLoopCooldown = 30 * time.Second
 
 func newMonitor(names []string, cfg Config) *Monitor {
 	m := &Monitor{states: make(map[string]RuntimeState)}
@@ -109,11 +114,20 @@ func (m *Monitor) remove(name string) {
 func (m *Monitor) addLog(name, stream, message string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if len(m.logs) > 0 {
+		last := &m.logs[len(m.logs)-1]
+		if last.Service == name && last.Stream == stream && last.Message == message {
+			last.Time = time.Now()
+			last.Count++
+			return
+		}
+	}
 	m.logs = append(m.logs, RuntimeLog{
 		Time:    time.Now(),
 		Service: name,
 		Stream:  stream,
 		Message: message,
+		Count:   1,
 	})
 	if len(m.logs) > maxLogs {
 		m.logs = append([]RuntimeLog(nil), m.logs[len(m.logs)-maxLogs:]...)
@@ -279,28 +293,32 @@ type tickMsg time.Time
 type shutdownDoneMsg struct{}
 
 type appModel struct {
-	cfg       Config
-	cfgPath   string
-	mon       *Monitor
-	runner    *Runner
-	initial   []string
-	services  []string
-	groups    []string
-	tab       string
-	cursor    int
-	groupCur  int
-	width     int
-	height    int
-	addMode   bool
-	addCursor int
-	addMarked map[string]bool
-	addItems  []addItem
-	form      *serviceForm
-	groupForm *groupForm
-	returnAdd bool
-	shutdown  bool
-	pulse     int
-	message   string
+	cfg        Config
+	cfgPath    string
+	mon        *Monitor
+	runner     *Runner
+	initial    []string
+	services   []string
+	groups     []string
+	tab        string
+	cursor     int
+	groupCur   int
+	width      int
+	height     int
+	addMode    bool
+	addCursor  int
+	addMarked  map[string]bool
+	addItems   []addItem
+	addQuery   string
+	addSearch  bool
+	form       *serviceForm
+	groupForm  *groupForm
+	returnAdd  bool
+	shutdown   bool
+	pulse      int
+	logYOffset int
+	logFollow  bool
+	message    string
 }
 
 type addItem struct {
@@ -362,16 +380,17 @@ func newAppModel(cfg Config, mon *Monitor, runner *Runner, initial []string) app
 	path, _ := configPath()
 	tab := "monitor"
 	return appModel{
-		cfg:      cfg,
-		cfgPath:  path,
-		mon:      mon,
-		runner:   runner,
-		initial:  initial,
-		services: services,
-		groups:   groups,
-		tab:      tab,
-		width:    100,
-		height:   30,
+		cfg:       cfg,
+		cfgPath:   path,
+		mon:       mon,
+		runner:    runner,
+		initial:   initial,
+		services:  services,
+		groups:    groups,
+		tab:       tab,
+		width:     100,
+		height:    30,
+		logFollow: true,
 	}
 }
 
@@ -407,6 +426,29 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickCmd()
 	case shutdownDoneMsg:
 		return m, tea.Quit
+	case tea.MouseMsg:
+		if m.shutdown || m.form != nil || m.groupForm != nil {
+			return m, nil
+		}
+		if m.addMode {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				m.moveAddCursor(-3)
+			case tea.MouseButtonWheelDown:
+				m.moveAddCursor(3)
+			}
+			return m, nil
+		}
+		if m.tab != "monitor" {
+			return m, nil
+		}
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.scrollLogs(3)
+		case tea.MouseButtonWheelDown:
+			m.scrollLogs(-3)
+		}
+		return m, nil
 	case tea.KeyMsg:
 		key := msg.String()
 		if m.shutdown {
@@ -420,6 +462,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.addMode {
 			return m.updateAddMode(key)
+		}
+		if m.tab == "monitor" {
+			m.clampMonitorCursor()
 		}
 		switch key {
 		case "q", "ctrl+c":
@@ -455,6 +500,8 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.message = ""
 		case "c":
 			m.mon.clearLogs()
+			m.logYOffset = 0
+			m.logFollow = true
 			m.message = "logs cleared"
 		case "s":
 			name := m.selectedServiceForAction()
@@ -544,10 +591,49 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m appModel) updateAddMode(key string) (tea.Model, tea.Cmd) {
-	choices := m.addItems
+	if m.addSearch {
+		switch key {
+		case "up", "k":
+			m.moveAddCursor(-1)
+		case "down", "j":
+			m.moveAddCursor(1)
+		case "esc":
+			m.addSearch = false
+			if m.addQuery == "" {
+				m.message = ""
+			}
+		case "enter":
+			m.addSearch = false
+		case "backspace":
+			if len(m.addQuery) > 0 {
+				m.addQuery = m.addQuery[:len(m.addQuery)-1]
+				m.clampAddCursor()
+			}
+		case "ctrl+u":
+			m.addQuery = ""
+			m.addCursor = 0
+		default:
+			if len(key) == 1 && key >= " " {
+				m.addQuery += key
+				m.addCursor = 0
+			}
+		}
+		return m, nil
+	}
+
+	choices := m.filteredAddItems()
 	switch key {
 	case "esc", "q":
-		m.addMode = false
+		if m.addQuery != "" {
+			m.addQuery = ""
+			m.addCursor = 0
+			m.message = ""
+		} else {
+			m.addMode = false
+			m.message = ""
+		}
+	case "/":
+		m.addSearch = true
 		m.message = ""
 	case "n":
 		m.addMode = false
@@ -573,13 +659,9 @@ func (m appModel) updateAddMode(key string) (tea.Model, tea.Cmd) {
 		}
 		m.message = ""
 	case "up", "k":
-		if m.addCursor > 0 {
-			m.addCursor--
-		}
+		m.moveAddCursor(-1)
 	case "down", "j":
-		if m.addCursor < len(choices)-1 {
-			m.addCursor++
-		}
+		m.moveAddCursor(1)
 	case "enter":
 		if len(choices) > 0 {
 			toStart := make([]string, 0)
@@ -625,6 +707,32 @@ func (m appModel) updateAddMode(key string) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *appModel) moveAddCursor(delta int) {
+	choices := m.filteredAddItems()
+	if len(choices) == 0 {
+		m.addCursor = 0
+		return
+	}
+	m.addCursor += delta
+	if m.addCursor < 0 {
+		m.addCursor = 0
+	}
+	if m.addCursor >= len(choices) {
+		m.addCursor = len(choices) - 1
+	}
+}
+
+func (m *appModel) clampAddCursor() {
+	choices := m.filteredAddItems()
+	if len(choices) == 0 || m.addCursor < 0 {
+		m.addCursor = 0
+		return
+	}
+	if m.addCursor >= len(choices) {
+		m.addCursor = len(choices) - 1
+	}
 }
 
 func newServiceForm(editName string, svc Service) *serviceForm {
@@ -860,10 +968,76 @@ func (m appModel) renderMonitor(stateByName map[string]RuntimeState, logs []Runt
 
 	body := message + servicePanel + "\n"
 	if logHeight >= minLogHeight {
-		logPanel := m.viewportPanel(m.renderLogsContent(logs), logHeight, 0, true)
+		logContent := m.renderLogsContent(logs)
+		logViewportHeight := max(1, logHeight-2)
+		maxYOffset := max(0, lipgloss.Height(strings.TrimRight(logContent, "\n"))-logViewportHeight)
+		logYOffset := m.logYOffset
+		if m.logFollow {
+			logYOffset = maxYOffset
+		}
+		if logYOffset > maxYOffset {
+			logYOffset = maxYOffset
+		}
+		logPanel := m.viewportPanel(logContent, logHeight, logYOffset, false)
 		body = message + servicePanel + "\n\n" + logPanel + "\n"
 	}
 	return m.withBottomHelp(body, helpPanel)
+}
+
+func (m *appModel) scrollLogs(delta int) {
+	maxYOffset := m.maxLogYOffset()
+	if m.logFollow {
+		m.logYOffset = maxYOffset
+		m.logFollow = false
+	}
+	m.logYOffset -= delta
+	if m.logYOffset < 0 {
+		m.logYOffset = 0
+	}
+	if m.logYOffset >= maxYOffset {
+		m.logYOffset = maxYOffset
+		m.logFollow = true
+	}
+}
+
+func (m appModel) maxLogYOffset() int {
+	_, logs := m.mon.snapshot()
+	if len(logs) == 0 {
+		return 0
+	}
+	messageHeight := 0
+	if m.message != "" {
+		messageHeight = 1
+	}
+	helpHeight := lipgloss.Height(m.panel(m.helpText()))
+	gapBeforeHelp := 1
+	if m.height < 14 {
+		gapBeforeHelp = 0
+	}
+	available := m.height - helpHeight - messageHeight - gapBeforeHelp
+	minServiceHeight := 6
+	minLogHeight := 6
+	if available < minServiceHeight+1+minLogHeight {
+		return 0
+	}
+	states, _ := m.mon.snapshot()
+	stateByName := make(map[string]RuntimeState, len(states))
+	for _, state := range states {
+		stateByName[state.Name] = state
+	}
+	tableNoLogo := m.renderTableLimited(stateByName, -1, false)
+	naturalServiceHeight := lipgloss.Height(tableNoLogo) + 2
+	serviceHeight := min(naturalServiceHeight, available-minLogHeight-1)
+	if serviceHeight < minServiceHeight {
+		serviceHeight = minServiceHeight
+	}
+	logHeight := available - serviceHeight - 1
+	if logHeight < minLogHeight {
+		return 0
+	}
+	logViewportHeight := max(1, logHeight-2)
+	logContentHeight := lipgloss.Height(strings.TrimRight(m.renderLogsContent(logs), "\n"))
+	return max(0, logContentHeight-logViewportHeight)
 }
 
 func (m appModel) viewportPanel(content string, totalHeight, yOffset int, bottom bool) string {
@@ -1408,11 +1582,15 @@ func (m appModel) renderLogsLimited(logs []RuntimeLog, maxRows int) string {
 		} else {
 			stream = mutedStyle.Render(stream)
 		}
+		message := entry.Message
+		if entry.Count > 1 {
+			message = fmt.Sprintf("%s %s", message, mutedStyle.Render(fmt.Sprintf("x%d", entry.Count)))
+		}
 		b.WriteString(fmt.Sprintf("%s %-16s %-8s %s\n",
 			mutedStyle.Render(entry.Time.Format("15:04:05")),
 			"["+truncate(entry.Service, 14)+"]",
 			stream,
-			truncate(entry.Message, msgWidth),
+			truncate(message, msgWidth),
 		))
 	}
 	return b.String()
@@ -1423,15 +1601,16 @@ func (m appModel) renderAddPicker() string {
 }
 
 func (m appModel) renderAddPage() string {
-	choices := m.addItems
+	choices := m.filteredAddItems()
 	var b strings.Builder
 	b.WriteString(headerStyle.Render("Start services") + "\n")
-	b.WriteString(mutedStyle.Render("Select services or groups to add to this session. Running services are skipped.") + "\n\n")
+	b.WriteString(mutedStyle.Render("Select services or groups to add to this session. Running services are skipped.") + "\n")
+	b.WriteString(m.renderAddSearchLine(len(choices)) + "\n\n")
 	if m.message != "" {
 		b.WriteString(cyanStyle.Render(m.message) + "\n\n")
 	}
 	if len(choices) == 0 {
-		b.WriteString(mutedStyle.Render("No stopped services available") + "\n")
+		b.WriteString(mutedStyle.Render("No matching services or groups") + "\n")
 		help := m.panel(m.renderAddHelp())
 		return m.withBottomHelp(m.panelWithHeight(b.String(), max(10, m.height-6))+"\n", help)
 	}
@@ -1484,6 +1663,23 @@ func (m appModel) renderAddPage() string {
 	return m.withBottomHelp(m.panelWithHeight(b.String(), max(12, m.height-6))+"\n", help)
 }
 
+func (m appModel) renderAddSearchLine(count int) string {
+	cursor := ""
+	if m.addSearch {
+		cursor = selectedStyle.Render("█")
+	}
+	query := m.addQuery
+	if query == "" {
+		query = mutedStyle.Render("type to filter...")
+	}
+	total := len(m.addItems)
+	countLabel := mutedStyle.Render(fmt.Sprintf("%d/%d", count, total))
+	if m.addQuery == "" {
+		countLabel = mutedStyle.Render(fmt.Sprintf("%d items", total))
+	}
+	return keyStyle.Render("/") + " " + query + cursor + "  " + countLabel
+}
+
 func (m appModel) renderAddItemRow(item addItem, mark string, runningCount int, selected bool) string {
 	services := m.servicesForAddItem(item)
 	allRunning := len(services) > 0 && runningCount == len(services)
@@ -1529,6 +1725,8 @@ func (m appModel) renderAddItemRow(item addItem, mark string, runningCount int, 
 func (m appModel) renderAddHelp() string {
 	return m.renderHelpGrid([]helpItem{
 		{"up/down", "move"},
+		{"wheel", "scroll"},
+		{"/", "search"},
 		{"space", "mark"},
 		{"enter", "start"},
 		{"n", "new service"},
@@ -1543,6 +1741,8 @@ func (m *appModel) openAddMenu(message string) {
 	m.addCursor = 0
 	m.addMarked = make(map[string]bool)
 	m.addItems = m.buildAddItems()
+	m.addQuery = ""
+	m.addSearch = false
 	m.message = message
 }
 
@@ -1560,6 +1760,40 @@ func (m appModel) buildAddItems() []addItem {
 		items = append(items, addItem{Kind: "service", Name: service})
 	}
 	return items
+}
+
+func (m appModel) filteredAddItems() []addItem {
+	query := strings.TrimSpace(strings.ToLower(m.addQuery))
+	if query == "" {
+		return m.addItems
+	}
+	items := make([]addItem, 0, len(m.addItems))
+	for _, item := range m.addItems {
+		if m.addItemMatches(item, query) {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (m appModel) addItemMatches(item addItem, query string) bool {
+	if strings.Contains(strings.ToLower(item.Name), query) || strings.Contains(item.Kind, query) {
+		return true
+	}
+	if item.Kind == "group" {
+		for _, service := range m.cfg.Groups[item.Name] {
+			if strings.Contains(strings.ToLower(service), query) {
+				return true
+			}
+		}
+		return false
+	}
+	svc, ok := m.cfg.Services[item.Name]
+	if !ok {
+		return false
+	}
+	return strings.Contains(strings.ToLower(svc.Command), query) ||
+		strings.Contains(strings.ToLower(svc.CWD), query)
 }
 
 func addItemKey(item addItem) string {
@@ -1616,10 +1850,17 @@ func (m appModel) activeStatesFromMap(stateByName map[string]RuntimeState) []Run
 
 func (m appModel) selectedActiveService() string {
 	names := m.activeNames()
-	if m.cursor < 0 || m.cursor >= len(names) {
+	if len(names) == 0 {
 		return ""
 	}
-	return names[m.cursor]
+	cursor := m.cursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= len(names) {
+		cursor = len(names) - 1
+	}
+	return names[cursor]
 }
 
 func (m appModel) selectedConfigService() string {
@@ -1641,6 +1882,20 @@ func (m appModel) selectedServiceForAction() string {
 		return m.selectedConfigService()
 	}
 	return m.selectedActiveService()
+}
+
+func (m *appModel) clampMonitorCursor() {
+	names := m.activeNames()
+	if len(names) == 0 {
+		m.cursor = 0
+		return
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= len(names) {
+		m.cursor = len(names) - 1
+	}
 }
 
 func (m *appModel) nextTab() {
@@ -1700,7 +1955,7 @@ func styledStatus(status string) string {
 		return greenStyle.Render("● " + label)
 	case "starting", "restarting":
 		return yellowStyle.Render("◆ " + label)
-	case "crashed", "error":
+	case "crashed", "error", "crash-loop":
 		return redStyle.Render("✕ " + label)
 	case "scheduled", "queued":
 		return cyanStyle.Render("◷ " + label)
@@ -2234,7 +2489,7 @@ func cmdOpenAppAt(names []string, tab string) error {
 	if tab != "" {
 		model.tab = tab
 	}
-	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithoutSignalHandler())
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithoutSignalHandler())
 	go func() {
 		<-ctx.Done()
 		runner.StopAll()
@@ -2296,6 +2551,7 @@ func superviseScheduled(ctx context.Context, mon *Monitor, name string, svc Serv
 
 func superviseNow(ctx context.Context, mon *Monitor, name string, svc Service) {
 	attempt := 0
+	crashStreak := 0
 	for {
 		if ctx.Err() != nil {
 			return
@@ -2314,11 +2570,18 @@ func superviseNow(ctx context.Context, mon *Monitor, name string, svc Service) {
 		})
 		mon.addLog(name, "sys", status)
 
+		started := time.Now()
 		exitCode, err := runOnce(ctx, mon, name, svc)
 		if ctx.Err() != nil {
 			return
 		}
+		runtime := time.Since(started)
 		if err != nil {
+			if runtime <= crashLoopWindow {
+				crashStreak++
+			} else {
+				crashStreak = 1
+			}
 			mon.update(name, func(state *RuntimeState) {
 				state.Status = "crashed"
 				state.PID = 0
@@ -2326,6 +2589,7 @@ func superviseNow(ctx context.Context, mon *Monitor, name string, svc Service) {
 			})
 			mon.addLog(name, "sys", fmt.Sprintf("crashed exit=%d error=%v", exitCode, err))
 		} else {
+			crashStreak = 0
 			mon.update(name, func(state *RuntimeState) {
 				state.Status = "stopped"
 				state.PID = 0
@@ -2337,10 +2601,23 @@ func superviseNow(ctx context.Context, mon *Monitor, name string, svc Service) {
 			return
 		}
 
+		delay := restartDelay
+		if crashStreak >= crashLoopLimit {
+			delay = crashLoopCooldown
+			mon.update(name, func(state *RuntimeState) {
+				state.Status = "crash-loop"
+				state.LastExit = fmt.Sprintf("too many crashes, cooling down for %s", delay)
+			})
+			mon.addLog(name, "sys", fmt.Sprintf("crash-loop: %d crashes, cooling down for %s", crashStreak, delay))
+			crashStreak = 0
+		}
+		mon.update(name, func(state *RuntimeState) {
+			state.NextRun = time.Now().Add(delay)
+		})
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(3 * time.Second):
+		case <-time.After(delay):
 		}
 	}
 }
